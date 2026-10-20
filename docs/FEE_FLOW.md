@@ -25,7 +25,7 @@ platform_fee = funded * fee_bps / 10_000
 |---|---|---|
 | 1 000 000 | 150 bps (1.5%) | 15 000 |
 | 1 000 000 | 0 bps | 0 |
-| 999 | 150 bps | 1 (exact value 1.4985, rounded down) |
+| 999 | 150 bps | 14 (exact value 14.985, rounded down) |
 
 ## Funding share
 
