@@ -91,6 +91,21 @@ mod test;
 mod fuzz_tests;
 
 #[cfg(test)]
+mod testing_support;
+
+#[cfg(test)]
+mod state_machine_tests;
+
+#[cfg(test)]
+mod boundary_tests;
+
+#[cfg(test)]
+mod concurrency_tests;
+
+#[cfg(test)]
+mod perf_regression_tests;
+
+#[cfg(test)]
 mod storage_snapshot;
 
 mod storage;
