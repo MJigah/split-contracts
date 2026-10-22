@@ -4,9 +4,12 @@ use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, Vec,
+    Address, Bytes, BytesN, Env, Symbol, Vec,
 };
-use types::InvoiceOptions;
+use types::{
+    EncryptionAlgorithm, EncryptionValidation, InvoiceOptions, Permission, Role, CacheMetrics,
+    QueryMetrics,
+};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -3122,4 +3125,411 @@ fn test_analytics_multiple_operations() {
     assert_eq!(tv, 400);
     assert_eq!(tr, 400);
     assert_eq!(tref, 50);
+}
+
+
+// ---------------------------------------------------------------------------
+// Issue #1012: Encryption tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_encryption_set_key() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &admin, &admin, &0_u32);
+    c.set_encryption_key(&admin, &EncryptionAlgorithm::Aes256Gcm, &BytesN::from_array(&env, &[42u8; 32]));
+
+    assert_eq!(c.get_encryption_key_version(), 1);
+}
+
+#[test]
+fn test_encryption_rotate_key() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &admin, &admin, &0_u32);
+    c.set_encryption_key(&admin, &EncryptionAlgorithm::Aes256Gcm, &BytesN::from_array(&env, &[42u8; 32]));
+    assert_eq!(c.get_encryption_key_version(), 1);
+
+    c.rotate_encryption_key(&admin, &EncryptionAlgorithm::ChaCha20Poly1305, &BytesN::from_array(&env, &[99u8; 32]));
+    assert_eq!(c.get_encryption_key_version(), 2);
+}
+
+#[test]
+fn test_encryption_encrypt_decrypt() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let caller = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &admin, &admin, &0_u32);
+    c.set_encryption_key(&admin, &EncryptionAlgorithm::Aes256Gcm, &BytesN::from_array(&env, &[42u8; 32]));
+
+    let data = Bytes::from_array(&env, &[1, 2, 3, 4, 5, 6, 7, 8]);
+    let encrypted = c.encrypt_data(&caller, &data);
+
+    // Decrypt with version 1 (the active version).
+    let decrypted = c.decrypt_data(&caller, &encrypted, &1u32);
+    assert_eq!(decrypted, data);
+}
+
+#[test]
+fn test_encryption_validate() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let caller = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &admin, &admin, &0_u32);
+    c.set_encryption_key(&admin, &EncryptionAlgorithm::Aes256Gcm, &BytesN::from_array(&env, &[42u8; 32]));
+
+    let data = Bytes::from_array(&env, &[10, 20, 30, 40]);
+    let _ = c.encrypt_data(&caller, &data);
+
+    // Validate the data was encrypted with key version 1.
+    let validation = c.validate_encryption(&data, &1u32);
+    assert_eq!(validation.key_version, 1);
+}
+
+#[test]
+fn test_encryption_audit_trail() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let caller = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &admin, &admin, &0_u32);
+    c.set_encryption_key(&admin, &EncryptionAlgorithm::Aes256Gcm, &BytesN::from_array(&env, &[42u8; 32]));
+
+    let data = Bytes::from_array(&env, &[1, 2, 3]);
+    c.encrypt_data(&caller, &data);
+
+    let audit = c.get_encryption_audit();
+    // Should have at least 2 entries: set_key + encrypt.
+    assert!(audit.len() >= 2);
+}
+
+#[test]
+#[should_panic(expected = "encryption key already set")]
+fn test_encryption_set_key_twice_panics() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &admin, &admin, &0_u32);
+    c.set_encryption_key(&admin, &EncryptionAlgorithm::Aes256Gcm, &BytesN::from_array(&env, &[42u8; 32]));
+    c.set_encryption_key(&admin, &EncryptionAlgorithm::Aes256Gcm, &BytesN::from_array(&env, &[99u8; 32]));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1013: RBAC tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rbac_assign_and_check_role() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &admin, &admin, &0_u32);
+    c.assign_role(&admin, &user, &Role::Creator);
+
+    assert!(c.has_role(&user, &Role::Creator));
+    assert!(!c.has_role(&user, &Role::Payer));
+}
+
+#[test]
+fn test_rbac_revoke_role() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &admin, &admin, &0_u32);
+    c.assign_role(&admin, &user, &Role::Payer);
+    assert!(c.has_role(&user, &Role::Payer));
+
+    c.revoke_role(&admin, &user, &Role::Payer);
+    assert!(!c.has_role(&user, &Role::Payer));
+}
+
+#[test]
+fn test_rbac_permission_check() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &admin, &admin, &0_u32);
+    c.assign_role(&admin, &user, &Role::Creator);
+
+    // Creator has CreateInvoice permission.
+    assert!(c.has_permission(&user, &Permission::CreateInvoice));
+    // Creator does not have Pay permission.
+    assert!(!c.has_permission(&user, &Permission::Pay));
+}
+
+#[test]
+fn test_rbac_get_roles() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &admin, &admin, &0_u32);
+    c.assign_role(&admin, &user, &Role::Creator);
+    c.assign_role(&admin, &user, &Role::Payer);
+
+    let roles = c.get_roles(&user);
+    assert_eq!(roles.len(), 2);
+}
+
+#[test]
+fn test_rbac_audit_trail() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &admin, &admin, &0_u32);
+    c.assign_role(&admin, &user, &Role::Creator);
+    c.revoke_role(&admin, &user, &Role::Creator);
+
+    let audit = c.get_rbac_audit();
+    // assign + revoke = 2 entries.
+    assert_eq!(audit.len(), 2);
+}
+
+#[test]
+fn test_rbac_access_analytics() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &admin, &admin, &0_u32);
+    c.assign_role(&admin, &user, &Role::Creator);
+    c.assign_role(&admin, &user, &Role::Payer);
+    c.revoke_role(&admin, &user, &Role::Payer);
+    c.has_permission(&user, &Permission::CreateInvoice);
+
+    let analytics = c.get_access_analytics(&user);
+    assert_eq!(analytics.roles_assigned, 2);
+    assert_eq!(analytics.roles_revoked, 1);
+    assert_eq!(analytics.permission_checks, 1);
+    assert_eq!(analytics.checks_passed, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1014: Caching tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cache_set_and_get() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let key = Symbol::new(&env, "my_key");
+    let value = Bytes::from_array(&env, &[1, 2, 3, 4, 5]);
+
+    c.cache_set(&key, &value, &0u64);
+    let retrieved = c.cache_get(&key);
+    assert_eq!(retrieved, value);
+}
+
+#[test]
+fn test_cache_invalidate() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let key = Symbol::new(&env, "inv_key");
+    let value = Bytes::from_array(&env, &[10, 20, 30]);
+
+    c.cache_set(&key, &value, &0u64);
+    assert_eq!(c.cache_get(&key), value);
+
+    c.cache_invalidate(&key);
+
+    // After invalidation, get should panic.
+    // (We verify the metrics show invalidation.)
+    let metrics = c.get_cache_metrics();
+    assert_eq!(metrics.invalidated, 1);
+}
+
+#[test]
+fn test_cache_metrics() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let key1 = Symbol::new(&env, "k1");
+    let key2 = Symbol::new(&env, "k2");
+    let value = Bytes::from_array(&env, &[1]);
+
+    // Set two entries.
+    c.cache_set(&key1, &value, &0u64);
+    c.cache_set(&key2, &value, &0u64);
+
+    // Hit on key1.
+    c.cache_get(&key1);
+
+    // Miss on non-existent key3 would panic, so just check metrics from hit.
+    let metrics = c.get_cache_metrics();
+    assert_eq!(metrics.hits, 1);
+    assert_eq!(metrics.misses, 0);
+    assert_eq!(metrics.entry_count, 2);
+}
+
+#[test]
+fn test_cache_warm() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(id1);
+    ids.push_back(id2);
+
+    let warmed = c.cache_warm(&ids);
+    assert_eq!(warmed, 2);
+
+    let metrics = c.get_cache_metrics();
+    assert_eq!(metrics.warmed, 2);
+}
+
+#[test]
+fn test_cache_hit_ratio() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let key = Symbol::new(&env, "ratio_key");
+    let value = Bytes::from_array(&env, &[1]);
+
+    c.cache_set(&key, &value, &0u64);
+    c.cache_get(&key); // hit
+    c.cache_get(&key); // hit
+
+    let metrics = c.get_cache_metrics();
+    assert_eq!(metrics.hits, 2);
+    assert_eq!(metrics.misses, 0);
+    assert_eq!(metrics.hit_ratio_bps, 10_000); // 100%
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1015: Query optimization tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_query_invoices_by_status() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    // Both should be Pending.
+    let pending = c.get_invoices_by_status(&InvoiceStatus::Pending);
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending.get(0).unwrap(), id1);
+    assert_eq!(pending.get(1).unwrap(), id2);
+
+    // No released invoices.
+    let released = c.get_invoices_by_status(&InvoiceStatus::Released);
+    assert_eq!(released.len(), 0);
+}
+
+#[test]
+fn test_query_invoices_by_creator() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let other_creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    let _id3 = make_invoice(&env, &c, &other_creator, &recipient, 300, &token_id, 9_999);
+
+    let creator_invoices = c.get_invoices_by_creator(&creator);
+    assert_eq!(creator_invoices.len(), 2);
+    assert_eq!(creator_invoices.get(0).unwrap(), id1);
+    assert_eq!(creator_invoices.get(1).unwrap(), id2);
+
+    let other_invoices = c.get_invoices_by_creator(&other_creator);
+    assert_eq!(other_invoices.len(), 1);
+}
+
+#[test]
+fn test_query_metrics() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Execute some queries.
+    c.get_invoices_by_status(&InvoiceStatus::Pending);
+    c.get_invoices_by_creator(&creator.clone());
+
+    let metrics = c.get_query_metrics();
+    assert_eq!(metrics.total_queries, 2);
+    assert_eq!(metrics.indexed_queries, 2);
+    assert_eq!(metrics.full_scan_queries, 0);
+}
+
+#[test]
+fn test_query_create_index() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &admin, &admin, &0_u32);
+    c.create_query_index(&admin, &Symbol::new(&env, "custom_idx"));
+
+    let metrics = c.get_query_metrics();
+    assert_eq!(metrics.index_count, 1);
 }

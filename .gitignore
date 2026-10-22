@@ -24,6 +24,8 @@ Thumbs.db
 # Test snapshots
 **/__snapshots__/
 *.snap
+test_snapshots/
+contracts/*/test_snapshots/
 
 # Stellar CLI
 .stellar/
